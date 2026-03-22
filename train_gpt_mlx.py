@@ -31,6 +31,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 # ==============================================================================
 
 COMPUTE_DTYPE = mx.bfloat16
+# FP16 embeddings save space in the 16MB model budget vs bfloat16 (identical size but
+# better hardware-native fp16 quantization alignment). Toggle via EMBED_DTYPE env var.
+EMBED_DTYPE_NAME = os.environ.get("EMBED_DTYPE", "float16")
+EMBED_DTYPE = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}[EMBED_DTYPE_NAME]
 
 # ==============================================================================
 # HYPERPARAMETERS
@@ -55,7 +59,9 @@ class Hyperparameters:
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
-    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
+    # Longer sequences let the model learn longer-range dependencies, improving BPB.
+    # Default bumped from 1024 → 2048. Override with TRAIN_SEQ_LEN to test.
+    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 2048)))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 512))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
@@ -90,6 +96,8 @@ class Hyperparameters:
     matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    # Weight decay on Muon-optimized matrix params prevents overfitting.
+    muon_weight_decay: float = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -410,7 +418,7 @@ class GPT(nn.Module):
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
-        ).astype(COMPUTE_DTYPE)
+        ).astype(EMBED_DTYPE)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -477,6 +485,7 @@ class Muon:
         else:
             momentum = self.args.muon_momentum
         lr = self.args.matrix_lr * lr_mul
+        wd = self.args.muon_weight_decay
         out: dict[str, mx.array] = {}
         for k in self.keys:
             p = params[k]
@@ -486,6 +495,9 @@ class Muon:
             g_eff = g + momentum * buf
             g_ortho = zeropower_newtonschulz5(g_eff, self.args.muon_backend_steps)
             scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
+            # Decoupled weight decay (applied to params directly, not through gradient)
+            if wd > 0.0:
+                p = p * (1.0 - lr * wd)
             out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
         return out
 
@@ -1026,10 +1038,10 @@ def main() -> None:
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps} muon_wd:{args.muon_weight_decay}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path} eval_stride:{args.eval_stride}")
-    log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    log(f"compute_dtype:{COMPUTE_DTYPE} embed_dtype:{EMBED_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
