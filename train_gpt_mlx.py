@@ -91,7 +91,7 @@ class Hyperparameters:
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     # BigramHash embeddings: replace standard token lookup with hash(prev_token, token)
     # to give the model richer bigram-level input features. Set to 0 to disable.
-    bigram_hash_size: int = int(os.environ.get("BIGRAM_HASH_SIZE", 10240))
+    bigram_hash_size: int = int(os.environ.get("BIGRAM_HASH_SIZE", 4096))
     # Int6 Quantization-Aware Training: simulate 6-bit quantization in the forward pass
     # using STE so the model learns to be robust to quantization noise. At save time,
     # weights are packed into int6 for dramatically smaller model files. Set to 0 to disable.
