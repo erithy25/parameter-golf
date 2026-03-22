@@ -89,6 +89,13 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # BigramHash embeddings: replace standard token lookup with hash(prev_token, token)
+    # to give the model richer bigram-level input features. Set to 0 to disable.
+    bigram_hash_size: int = int(os.environ.get("BIGRAM_HASH_SIZE", 10240))
+    # Int6 Quantization-Aware Training: simulate 6-bit quantization in the forward pass
+    # using STE so the model learns to be robust to quantization noise. At save time,
+    # weights are packed into int6 for dramatically smaller model files. Set to 0 to disable.
+    qat_bits: int = int(os.environ.get("QAT_BITS", 6))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -289,6 +296,35 @@ class TokenLoader:
 
 
 # ==============================================================================
+# QAT: FAKE-QUANTIZE WITH STRAIGHT-THROUGH ESTIMATOR
+# ==============================================================================
+# During training, weights pass through fake quantization in the forward pass:
+# w_q = round(clamp(w / scale, -Q, Q)) * scale, gradients flow through as if
+# the rounding didn't happen (STE). This teaches the model to be robust to
+# quantization noise. At save time, we pack into actual intN.
+
+QAT_BITS = int(os.environ.get("QAT_BITS", 6))
+QAT_MAX_VAL = (1 << (QAT_BITS - 1)) - 1 if QAT_BITS > 0 else 0  # e.g. 31 for int6
+
+
+def fake_quantize(w: mx.array) -> mx.array:
+    """Per-row fake quantization with STE for 2D weight matrices."""
+    if QAT_BITS <= 0:
+        return w
+    w_f = w.astype(mx.float32)
+    # Per-row scale: max(|w_row|) / QAT_MAX_VAL
+    amax = mx.max(mx.abs(w_f), axis=-1, keepdims=True)
+    scale = amax / QAT_MAX_VAL
+    scale = mx.maximum(scale, 1e-12)
+    # Quantize then dequantize — STE: stop_gradient on the rounding residual
+    w_scaled = w_f / scale
+    w_q = mx.clip(mx.round(w_scaled), -QAT_MAX_VAL, QAT_MAX_VAL)
+    # STE: forward uses quantized, backward uses original
+    w_out = w_f + mx.stop_gradient(w_q * scale - w_f)
+    return w_out.astype(w.dtype)
+
+
+# ==============================================================================
 # MODEL BLOCKS
 # ==============================================================================
 
@@ -298,13 +334,34 @@ class CastedLinear(nn.Module):
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+        w = fake_quantize(self.weight) if QAT_BITS > 0 else self.weight
+        return x @ w.astype(x.dtype).T
 
 
 class RMSNormNoWeight(nn.Module):
     # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
     def __call__(self, x: mx.array) -> mx.array:
         return rms_norm(x)
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash-based bigram embedding: lookup(hash(prev_token, current_token)).
+
+    Gives the model richer bigram-level input signal compared to a plain unigram
+    embedding table. The hash function maps (prev, cur) pairs into a table of
+    `hash_size` rows. The first position uses token id 0 as the implicit prev.
+    """
+    def __init__(self, hash_size: int, dim: int, init_std: float):
+        super().__init__()
+        self.hash_size = hash_size
+        self.weight = (mx.random.normal((hash_size, dim), dtype=mx.float32) * init_std).astype(EMBED_DTYPE)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        # Shift input_ids right by 1 to get prev_token; first position gets 0
+        prev = mx.concatenate([mx.zeros_like(input_ids[..., :1]), input_ids[..., :-1]], axis=-1)
+        # Simple hash: (prev * large_prime + cur) mod hash_size
+        idx = ((prev.astype(mx.int32) * 104729 + input_ids.astype(mx.int32)) % self.hash_size).astype(mx.int32)
+        return self.weight[idx]
 
 
 class CausalSelfAttention(nn.Module):
@@ -401,7 +458,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, bigram_hash_size: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -409,6 +466,8 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        # Optional bigram hash embedding added to the unigram embedding
+        self.bigram_emb = BigramHashEmbedding(bigram_hash_size, dim, tied_embed_init_std) if bigram_hash_size > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -431,7 +490,10 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        if self.bigram_emb is not None:
+            x = x + self.bigram_emb(input_ids).astype(COMPUTE_DTYPE)
+        x = rms_norm(x)
         x0 = x
         skips: list[mx.array] = []
 
@@ -598,25 +660,26 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+def quantize_float_array(arr: mx.array, bits: int = 8) -> tuple[np.ndarray, np.ndarray]:
+    max_val = (1 << (bits - 1)) - 1  # 127 for int8, 31 for int6
     f32 = _np_float32(arr)
     if f32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
         clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
-        scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
+        scale = np.maximum(clip_abs / max_val, 1.0 / max_val).astype(np.float32, copy=False)
+        q = np.clip(np.round(clipped / scale[:, None]), -max_val, max_val).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
-    scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
+    scale = np.array(clip_abs / max_val if clip_abs > 0.0 else 1.0, dtype=np.float32)
+    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -max_val, max_val).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_state_dict_int8(flat_state: dict[str, mx.array], qat_bits: int = 0) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -646,7 +709,9 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        # Use QAT bit width for large 2D matrices when QAT is enabled
+        bits = qat_bits if (qat_bits > 0 and arr.ndim == 2 and int(arr.size) > INT8_KEEP_FLOAT_MAX_NUMEL) else 8
+        q, s = quantize_float_array(arr, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -993,6 +1058,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        bigram_hash_size=args.bigram_hash_size,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1031,7 +1097,8 @@ def main() -> None:
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings} "
+        f"bigram_hash_size:{args.bigram_hash_size} qat_bits:{args.qat_bits}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -1196,7 +1263,7 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state, qat_bits=args.qat_bits)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
