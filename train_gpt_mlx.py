@@ -80,7 +80,9 @@ class Hyperparameters:
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    # 3x MLP expansion fits more useful capacity within the 16MB budget than 2x,
+    # because the wider MLP per layer is a better use of parameters.
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -102,6 +104,10 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Stochastic Weight Averaging: maintain a running mean of weights over the last
+    # fraction of training. The averaged model generalizes better than final weights.
+    # Set to 0.0 to disable.
+    swa_fraction: float = float(os.environ.get("SWA_FRACTION", 0.2))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -1041,7 +1047,7 @@ def main() -> None:
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps} muon_wd:{args.muon_weight_decay}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path} eval_stride:{args.eval_stride}")
-    log(f"compute_dtype:{COMPUTE_DTYPE} embed_dtype:{EMBED_DTYPE} compile:True")
+    log(f"compute_dtype:{COMPUTE_DTYPE} embed_dtype:{EMBED_DTYPE} swa_fraction:{args.swa_fraction} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
@@ -1088,6 +1094,10 @@ def main() -> None:
         mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+
+    # SWA: running average of model weights over the last swa_fraction of training.
+    swa_state: dict[str, mx.array] | None = None
+    swa_count: int = 0
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1139,6 +1149,19 @@ def main() -> None:
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
+        # SWA: accumulate running mean of weights during the last swa_fraction of training.
+        if args.swa_fraction > 0.0:
+            effective_total = stop_after_step if stop_after_step is not None else args.iterations
+            swa_start = int(effective_total * (1.0 - args.swa_fraction))
+            if step >= swa_start:
+                cur = dict(tree_flatten(model.parameters()))
+                swa_count += 1
+                if swa_state is None:
+                    swa_state = {k: v.astype(mx.float32) for k, v in cur.items()}
+                else:
+                    for k in swa_state:
+                        swa_state[k] = swa_state[k] + (cur[k].astype(mx.float32) - swa_state[k]) / swa_count
+
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
@@ -1150,6 +1173,17 @@ def main() -> None:
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
+
+    # ==============================================================================
+    # SWA: LOAD AVERAGED WEIGHTS BEFORE SERIALIZATION
+    # ==============================================================================
+    if swa_state is not None and swa_count > 0:
+        log(f"swa:applying averaged weights from {swa_count} snapshots")
+        # Cast SWA averages back to each parameter's original dtype
+        orig_params = dict(tree_flatten(model.parameters()))
+        swa_typed = {k: v.astype(orig_params[k].dtype) for k, v in swa_state.items()}
+        model.update(tree_unflatten(list(swa_typed.items())))
+        del swa_state  # free memory
 
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
