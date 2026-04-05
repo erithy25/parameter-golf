@@ -636,7 +636,7 @@ EMBED_DTYPE_MAP = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float3
 
 class BigramHashEmbedding(nn.Module):
     """Hash-based bigram embedding: lookup(hash(prev_token, cur_token))."""
-    def __init__(self, hash_size: int, dim: int, init_std: float, dtype: torch.dtype = torch.float16):
+    def __init__(self, hash_size: int, dim: int, init_std: float):
         super().__init__()
         self.hash_size = hash_size
         self.weight = nn.Parameter(torch.randn(hash_size, dim, dtype=torch.float32) * init_std)
@@ -644,7 +644,8 @@ class BigramHashEmbedding(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         prev = torch.cat([torch.zeros_like(input_ids[..., :1]), input_ids[..., :-1]], dim=-1)
         idx = (prev.long() * 104729 + input_ids.long()) % self.hash_size
-        return self.weight[idx]
+        # F.embedding is autocast-safe; direct weight[idx] indexing is not
+        return F.embedding(idx, self.weight)
 
 
 class CausalSelfAttention(nn.Module):
