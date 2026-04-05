@@ -70,7 +70,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -791,18 +791,21 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            if isinstance(module, nn.Linear):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                else:
+                    # OrthoInit: better starting point for Muon-optimized matrices
+                    nn.init.orthogonal_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _logits(self, input_ids: Tensor) -> Tensor:
+        """Shared forward body: input_ids -> softcapped logits."""
         x = self.tok_emb(input_ids)
         if self.bigram_emb is not None:
             x = x + self.bigram_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -810,41 +813,23 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self._logits(input_ids)
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
 
     def token_losses(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Per-token cross-entropy losses for sliding window evaluation."""
-        x = self.tok_emb(input_ids)
-        if self.bigram_emb is not None:
-            x = x + self.bigram_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="none").reshape(target_ids.shape)
+        """Per-token cross-entropy for sliding window evaluation."""
+        logits = self._logits(input_ids)
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="none").reshape(target_ids.shape)
 
 
 # -----------------------------
@@ -964,6 +949,12 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Apply configured embedding dtype (e.g. float16 for smaller serialized size)
+    embed_dtype = EMBED_DTYPE_MAP.get(args.embed_dtype_name, torch.float16)
+    with torch.no_grad():
+        base_model.tok_emb.weight.data = base_model.tok_emb.weight.data.to(embed_dtype)
+        if base_model.bigram_emb is not None:
+            base_model.bigram_emb.weight.data = base_model.bigram_emb.weight.data.to(embed_dtype)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1172,7 +1163,8 @@ def main() -> None:
         step += 1
 
         # SWA: accumulate running mean after swa_start_frac of training
-        if step / args.iterations >= swa_start_frac:
+        effective_total = stop_after_step if stop_after_step is not None else args.iterations
+        if effective_total > 0 and step / effective_total >= swa_start_frac:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
@@ -1263,6 +1255,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        base_model=base_model,
     )
     torch.cuda.synchronize()
     log0(
